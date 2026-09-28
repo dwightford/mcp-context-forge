@@ -5597,14 +5597,20 @@ class TestReadResourceCoverageEdges:
 
         content = ResourceContent(type="resource", id="tmpl-1", uri="greetme://morning/{name}", text="greetme://morning/John")
 
+        # `invoke_resource` returns the DOCUMENT here. It previously returned None, which left the
+        # template expansion ("greetme://morning/John" — identical to the request) standing as the
+        # body, so this coverage test was also asserting that answering a read with its own request
+        # is acceptable. It is not, and read_resource now refuses that shape; the include_inactive
+        # access-check branch this test exists to cover is exercised either way.
         with (
             patch.object(svc, "_read_template_resource", new_callable=AsyncMock, return_value=content),
             patch.object(svc, "_check_resource_access", new_callable=AsyncMock, return_value=True),
-            patch.object(svc, "invoke_resource", new_callable=AsyncMock, return_value=None),
+            patch.object(svc, "invoke_resource", new_callable=AsyncMock, return_value="Good Day, John"),
             patch("mcpgateway.services.metrics_buffer_service.get_metrics_buffer_service", return_value=MagicMock()),
         ):
             out = await svc.read_resource(db, resource_uri="greetme://morning/John", include_inactive=True)
         assert out.id == "tmpl-1"
+        assert out.text == "Good Day, John"
 
     @pytest.mark.asyncio
     async def test_read_resource_resource_id_fallback_include_inactive_true_bytes_content_records_metric_failure(self):
@@ -7971,3 +7977,87 @@ class TestReadResourceMetaDataValidationIntegration:
             await service.invoke_resource(db, resource_id="res-1", resource_uri="file:///test.txt", meta_data=hidden_depth)
 
         db.execute.assert_not_called()
+
+
+class TestFederatedTemplateReadMustNotEchoTheRequest:
+    """A federated template read whose fetch returns nothing must refuse, not echo the URI.
+
+    `_read_template_resource` cannot fetch anything: it answers with the template's own
+    expansion so `invoke_resource` has a URI to fetch with. When that fetch yields nothing the
+    expansion used to be returned AS THE DOCUMENT — a 200 whose body is the request, which a
+    client cannot tell from a real answer.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unfetched_template_expansion_is_refused(self):
+        # First-Party
+        from mcpgateway.common.models import ResourceContent
+        from mcpgateway.services import ResourceService
+        from mcpgateway.services.resource_service import ResourceError
+
+        service = ResourceService()
+        uri = "project://someproject/projection/reference_architecture"
+
+        # What the real _read_template_resource returns: the EXPANDED URI as placeholder text.
+        placeholder = ResourceContent(type="resource", id="template-id", uri="project://{slug}/projection/{type}", mime_type="text/plain", text=uri)
+
+        mock_execute_result = MagicMock()
+        mock_execute_result.scalar_one_or_none.return_value = None
+        mock_db = MagicMock()
+        mock_db.execute.return_value = mock_execute_result
+
+        with patch.object(service, "_read_template_resource", new=AsyncMock(return_value=placeholder)):
+            # The peer served nothing — the exact production condition.
+            with patch.object(service, "invoke_resource", new=AsyncMock(return_value=None)):
+                with pytest.raises(ResourceError) as exc_info:
+                    await service.read_resource(db=mock_db, resource_uri=uri)
+
+        assert "not the document" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_fetched_document_still_returned(self):
+        """NEGATIVE CONTROL: when the peer does serve the resource, nothing changes.
+
+        Without this, the guard above could pass by refusing every federated template read —
+        which is exactly the wrong repair.
+        """
+        # First-Party
+        from mcpgateway.common.models import ResourceContent
+        from mcpgateway.services import ResourceService
+
+        service = ResourceService()
+        uri = "project://someproject/projection/reference_architecture"
+        placeholder = ResourceContent(type="resource", id="template-id", uri="project://{slug}/projection/{type}", mime_type="text/plain", text=uri)
+
+        mock_execute_result = MagicMock()
+        mock_execute_result.scalar_one_or_none.return_value = None
+        mock_db = MagicMock()
+        mock_db.execute.return_value = mock_execute_result
+
+        with patch.object(service, "_read_template_resource", new=AsyncMock(return_value=placeholder)):
+            with patch.object(service, "invoke_resource", new=AsyncMock(return_value="# the real document\n")):
+                result = await service.read_resource(db=mock_db, resource_uri=uri)
+
+        assert result.text == "# the real document\n"
+
+    @pytest.mark.asyncio
+    async def test_other_placeholder_text_is_left_alone(self):
+        """A template handler that produced text OTHER than the request URI is not refused."""
+        # First-Party
+        from mcpgateway.common.models import ResourceContent
+        from mcpgateway.services import ResourceService
+
+        service = ResourceService()
+
+        content = ResourceContent(type="resource", id="template-id", uri="greetme://morning/{name}", mime_type="text/plain", text="Good Day, John")
+
+        mock_execute_result = MagicMock()
+        mock_execute_result.scalar_one_or_none.return_value = None
+        mock_db = MagicMock()
+        mock_db.execute.return_value = mock_execute_result
+
+        with patch.object(service, "_read_template_resource", new=AsyncMock(return_value=content)):
+            with patch.object(service, "invoke_resource", new=AsyncMock(return_value=None)):
+                result = await service.read_resource(db=mock_db, resource_uri="greetme://morning/John")
+
+        assert result.text == "Good Day, John"
