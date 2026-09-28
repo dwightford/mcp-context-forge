@@ -2223,6 +2223,9 @@ class ResourceService(BaseService):
         resource_db = None
         server_scoped = False
         resource_db_gateway = None  # Only set when eager-loaded via Q2's joinedload
+        # True once `_read_template_resource` has supplied a template expansion as a
+        # placeholder, so the fetch below can tell a real document from an unfetched one.
+        content_is_template_placeholder = False
         # CWE-400: Validate meta_data limits before any further processing
         _validate_meta_data(meta_data)
         content = None
@@ -2464,6 +2467,11 @@ class ResourceService(BaseService):
                         # the one which matches else raises ResourceNotFoundError
                         try:
                             content = await self._read_template_resource(db, uri) or None
+                            # `_read_template_resource` cannot fetch anything: it returns the template's
+                            # own expansion as a PLACEHOLDER for `invoke_resource` to replace below.
+                            # Remember that, so a federation that returns nothing cannot leave the
+                            # placeholder standing as the document.
+                            content_is_template_placeholder = content is not None
                             # ═══════════════════════════════════════════════════════════════════════════
                             # SECURITY: Fetch the template's DbResource record for access checking
                             # _read_template_resource returns ResourceContent with the template's ID
@@ -2557,6 +2565,33 @@ class ResourceService(BaseService):
                     )
                     if resource_response:
                         setattr(content, "text", resource_response)
+                    elif content_is_template_placeholder and str(getattr(content, "text", "") or "").strip() == str(uri or "").strip():
+                        # ── THE BODY MUST NEVER BE THE REQUEST ───────────────────────────────────
+                        #
+                        # `_read_template_resource` answers with `uri_template.format(**params)`,
+                        # i.e. THE EXPANDED URI, purely so `invoke_resource` above has something to
+                        # fetch with. When that fetch yields nothing — the peer refused this URI, the
+                        # peer is unreachable, the resource is not really servable — the expansion was
+                        # still sitting in `content.text`, and this method returned it:
+                        #
+                        #     read  project://someproject/projection/reference_architecture
+                        #     →     "project://someproject/projection/reference_architecture"
+                        #
+                        # A 200 whose body is the request is worse than an error. It is non-empty and
+                        # plausible, so a client digests it, cites it, and shows a person the URI as
+                        # the document's content. Measured on 1.0.5 through a virtual server against a
+                        # federated peer: a URI the peer rejects comes back as the body, with no error
+                        # anywhere in the chain.
+                        #
+                        # THE CONDITION IS DELIBERATELY NARROW — placeholder AND body == request. The
+                        # successful path is untouched (`resource_response` is truthy and replaces the
+                        # expansion), and a template whose handler legitimately produced some other
+                        # text is untouched too. Only the one indistinguishable-from-success shape is
+                        # refused.
+                        raise ResourceError(
+                            f"Resource '{uri}' matched a resource template, but fetching it returned no content. "
+                            "Refusing to answer with the expanded URI, which is the request, not the document."
+                        )
                 # If content is any object that quacks like content
                 elif hasattr(content, "text") or hasattr(content, "blob"):
                     # Metrics are recorded in read_resource finally block for all resources
